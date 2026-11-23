@@ -99,6 +99,7 @@ ATTRS = {
 JS = {
     "depuis le 23 sept. 2026": ("dal 23 sett. 2026", "desde el 23 sept. 2026"),
     "dont ": ("di cui ", "de los cuales "),
+    "Mis à jour le ": ("Aggiornato il ", "Actualizado el "),
     " au total": (" in totale", " en total"),
     " derniers événements": (" ultimi eventi", " últimos sucesos"),
     " dernier événement": (" ultimo evento", " último suceso"),
