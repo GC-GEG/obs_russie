@@ -18,6 +18,9 @@ from datetime import datetime
 HEADERS = ["ID", "Type", "Année", "Date événement", "Date entrée", "Nom", "Seuil d'attribution",
            "Catégorie", "Pays", "Ville / Région", "Descriptif", "Lat", "Lon",
            "Source 1", "Source 2", "Source 3"]
+# Colonne facultative (Q), après les 16 colonnes : date du dernier report d'une mise à jour de fond (règle F5).
+# Absente ou vide : pas de mise à jour. Publiée dans le champ « maj » (AAAA-MM-JJ, ou chaîne vide).
+MAJ_HEADER = "Date mise à jour"
 SEUILS = {"Non déterminé", "Suspecté", "Attribué", "Confirmé"}
 CATS = {"Sabotage", "Incendie", "Aéronef", "Renseignement", "Ingérence", "Frappes de navires", "Actions non classifiables"}
 TYPES = {"Nouveau": False, "Passé": True}
@@ -123,19 +126,22 @@ def read_rows(text, errors):
     head = [h.strip() for h in rows[0]]
     if head[:16] != HEADERS:
         raise SystemExit("En-têtes inattendus.\n  attendu : %s\n  reçu    : %s" % (HEADERS, head[:16]))
+    # Colonne Q facultative, repérée par son en-tête (17e colonne) ; sinon ignorée comme avant
+    qi = 16 if len(head) > 16 and head[16] == MAJ_HEADER else None
     out = []
     for n, r in enumerate(rows[1:], start=2):
-        r = [c.strip() for c in r] + [""] * (16 - len(r))
+        r = [c.strip() for c in r] + [""] * (17 - len(r))
         if not any(r[:16]):
             continue
-        out.append((n, r[:16]))
+        out.append((n, r[:16] + ([r[qi]] if qi is not None else [])))
     return out
 
 
 def build_events(rows, errors):
     events, seen = [], set()
     for n, r in rows:
-        (id_, typ, annee, d_ev, d_en, nom, seuil, cat, pays, lieu, desc, lat, lon, s1, s2, s3) = r
+        (id_, typ, annee, d_ev, d_en, nom, seuil, cat, pays, lieu, desc, lat, lon, s1, s2, s3) = r[:16]
+        d_maj = r[16] if len(r) > 16 else None  # None : colonne Q absente de la feuille
         loc = f"ligne {n} ({id_ or 'sans ID'})"
         if not id_:
             errors.append(f"{loc} : ID manquant"); continue
@@ -150,6 +156,13 @@ def build_events(rows, errors):
         date = parse_date(d_ev); entree = parse_date(d_en)
         if not date: errors.append(f"{loc} : Date événement illisible « {d_ev} »")
         if not entree: errors.append(f"{loc} : Date entrée illisible « {d_en} »")
+        maj = None
+        if d_maj is not None:
+            maj = parse_date(d_maj) if d_maj else ""
+            if maj is None:
+                errors.append(f"{loc} : Date mise à jour illisible « {d_maj} »")
+            elif maj and entree and maj < entree:
+                errors.append(f"{loc} : Date mise à jour {d_maj} antérieure à la Date entrée {d_en}")
         # Plusieurs points pour un même événement : valeurs séparées par « ; » (le premier est le point principal)
         las, los = [parse_num(x) for x in lat.split(";")], [parse_num(x) for x in lon.split(";")]
         la, lo = las[0], los[0]
@@ -168,7 +181,8 @@ def build_events(rows, errors):
             errors.append(f"{loc} : Année {annee} ≠ année de la date {date}")
         events.append({"id": id_, "passe": TYPES.get(typ, False), "date": date, "entree": entree, "nom": nom,
                        "seuil": seuil, "cat": cat, "pays": pays, "lieu": lieu, "desc": desc,
-                       "lat": la, "lon": lo, "sources": srcs, **({"more": more} if more else {})})
+                       "lat": la, "lon": lo, "sources": srcs, **({"more": more} if more else {}),
+                       **({"maj": maj} if maj is not None else {})})
     return events
 
 
@@ -231,7 +245,7 @@ def place(events, old):
 
 
 def ordered(e):
-    return {k: e[k] for k in ("id", "passe", "date", "entree", "nom", "seuil", "cat", "pays", "lieu", "desc",
+    return {k: e[k] for k in ("id", "passe", "date", "entree", "maj", "nom", "seuil", "cat", "pays", "lieu", "desc",
                               "lat", "lon", "sources", "pos", "more") if k in e}
 
 
@@ -280,8 +294,9 @@ def main():
 
     oldm = {e["id"]: e for e in old}; newm = {e["id"]: e for e in events}
     added = [i for i in newm if i not in oldm]; removed = [i for i in oldm if i not in newm]
-    changed = [i for i in newm if i in oldm and
-               {k: v for k, v in newm[i].items() if k != "pos"} != {k: v for k, v in oldm[i].items() if k != "pos"}]
+    # « maj » vide et « maj » absent valent la même chose : l'arrivée de la colonne Q ne marque pas tout comme modifié
+    cmp_ = lambda e: {k: v for k, v in e.items() if k != "pos" and not (k == "maj" and not v)}
+    changed = [i for i in newm if i in oldm and cmp_(newm[i]) != cmp_(oldm[i])]
     lines = [f"Données de l'Observatoire : {len(events)} événements"]
     if added: lines.append("Ajoutés : " + ", ".join(added))
     if removed: lines.append("Supprimés : " + ", ".join(removed))

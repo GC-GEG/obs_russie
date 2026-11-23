@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""Génère observatoire-data.json (événements) à partir de la feuille Google publiée en CSV.
+
+- Lit le CSV (adresse dans SHEET_CSV_URL, ou --csv pour un fichier local).
+- Vérifie chaque ligne (colonnes, valeurs autorisées, dates, coordonnées, sources).
+- Reprend telles quelles les données fixes du fichier existant (fond de carte, grille, cadrages).
+- Garde la position sur la carte des événements déjà présents si leurs coordonnées n'ont pas changé ;
+  calcule la position des nouveaux, en les écartant des points voisins.
+- Si une seule ligne est invalide, ou si plus de 3 lignes disparaissent d'un coup, rien n'est écrit
+  et le script échoue (le site garde l'ancienne version).
+- Lit aussi la feuille « Observatoire – Médias » (publiée en CSV, adresse dans MEDIA_CSV_URL) :
+  colonnes ID, Fichier, Type, Légende, Crédit ; seules les lignes dont « Fichier » est rempli sont publiées.
+Aucune dépendance : bibliothèque standard uniquement.
+"""
+import argparse, csv, io, json, math, os, sys, time, urllib.request
+from datetime import datetime
+
+HEADERS = ["ID", "Type", "Année", "Date événement", "Date entrée", "Nom", "Seuil d'attribution",
+           "Catégorie", "Pays", "Ville / Région", "Descriptif", "Lat", "Lon",
+           "Source 1", "Source 2", "Source 3"]
+# Colonne facultative (Q), après les 16 colonnes : date du dernier report d'une mise à jour de fond (règle F5).
+# Absente ou vide : pas de mise à jour. Publiée dans le champ « maj » (AAAA-MM-JJ, ou chaîne vide).
+MAJ_HEADER = "Date mise à jour"
+SEUILS = {"Non déterminé", "Suspecté", "Attribué", "Confirmé"}
+CATS = {"Sabotage", "Incendie", "Aéronef", "Renseignement", "Ingérence", "Frappes de navires", "Actions non classifiables"}
+TYPES = {"Nouveau": False, "Passé": True}
+MAX_DROP = 3  # nombre maximal de lignes retirées d'un coup sans --allow-shrink
+
+# Projection de la carte (stéréographique), ajustée sur les positions du fichier de départ.
+# Les positions sont en % de la largeur (1000) et de la hauteur (720) du cadre "eu".
+PROJ = dict(lon0=13.973, lat0=51.938, scale=2039.565, ox=486.373, oy=386.614)
+W, H = 1000.0, 720.0
+MIN_DIST = 17.7  # distance minimale entre deux points, en pixels du cadre (celle du fichier de départ : ~17,7)
+
+
+def project(lat, lon):
+    r = math.radians
+    l, f, f0 = r(lon - PROJ["lon0"]), r(lat), r(PROJ["lat0"])
+    k = 2 / (1 + math.sin(f0) * math.sin(f) + math.cos(f0) * math.cos(f) * math.cos(l))
+    x = PROJ["scale"] * k * math.cos(f) * math.sin(l) + PROJ["ox"]
+    y = -PROJ["scale"] * k * (math.cos(f0) * math.sin(f) - math.sin(f0) * math.cos(f) * math.cos(l)) + PROJ["oy"]
+    return x, y  # pixels
+
+
+def fetch(url):
+    if url.startswith("file://"):
+        url = url[7:]
+    if os.path.exists(url):
+        return open(url, encoding="utf-8-sig", newline="").read()
+    last = None
+    for i in range(4):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "observatoire-bot"})
+            with urllib.request.urlopen(req, timeout=40) as r:
+                return r.read().decode("utf-8-sig")
+        except Exception as e:  # noqa
+            last = e
+            time.sleep(3 * (i + 1))
+    raise SystemExit(f"Impossible de télécharger la feuille : {last}")
+
+
+MEDIA_TYPES = {"photo": "photo", "video": "vidéo", "vidéo": "vidéo", "satellite": "satellite", "image satellite": "satellite"}
+
+
+def media_url():
+    """Adresse CSV publiée de la feuille « Observatoire – Médias » (secret MEDIA_CSV_URL)."""
+    return os.environ.get("MEDIA_CSV_URL", "").strip()
+
+
+def build_media(text, ids, errors):
+    """Renvoie {ID: {src, type, alt, credit, lien}} ou None si l'onglet n'est pas lisible."""
+    if not text or text.lstrip().startswith("<"):
+        return None
+    rows = list(csv.reader(io.StringIO(text)))
+    if not rows:
+        return None
+    head = [h.strip().lower() for h in rows[0]]
+    col = {name: head.index(name) for name in ("id", "fichier", "type", "légende", "crédit", "lien") if name in head}
+    if "id" not in col or "fichier" not in col:
+        print("Onglet Médias : colonnes « ID » et « Fichier » introuvables ; images inchangées.", file=sys.stderr)
+        return None
+    get = lambda r, k: (r[col[k]].strip() if k in col and col[k] < len(r) else "")
+    out = {}
+    for n, r in enumerate(rows[1:], start=2):
+        id_, src = get(r, "id"), get(r, "fichier")
+        if not src:
+            continue  # pas encore d'image pour cette ligne
+        loc = f"Médias, ligne {n} ({id_ or 'sans ID'})"
+        typ = MEDIA_TYPES.get(get(r, "type").lower() or "photo")
+        if not id_: errors.append(f"{loc} : ID manquant"); continue
+        if id_ not in ids: errors.append(f"{loc} : ID inconnu dans la base")
+        if id_ in out: errors.append(f"{loc} : une seule image par événement")
+        if not src.startswith("https://"): errors.append(f"{loc} : Fichier doit être une adresse https:// « {src[:60]} »")
+        if not typ: errors.append(f"{loc} : Type « {get(r, 'type')} » (attendu photo, vidéo ou satellite)")
+        lien = get(r, "lien")
+        out[id_] = {k: v for k, v in (("src", src), ("type", typ or "photo"), ("alt", get(r, "légende")),
+                                      ("credit", get(r, "crédit")), ("lien", lien if lien.startswith("http") else "")) if v}
+    return dict(sorted(out.items()))
+
+
+def parse_date(s):
+    s = s.strip()
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return None
+
+
+def parse_num(s):
+    s = s.strip().replace(" ", "").replace(" ", "")
+    if "," in s and "." not in s:
+        s = s.replace(",", ".")  # feuille en paramètres régionaux français
+    try:
+        v = float(s)
+    except ValueError:
+        return None
+    return v if math.isfinite(v) else None
+
+
+def read_rows(text, errors):
+    rows = list(csv.reader(io.StringIO(text)))
+    if not rows:
+        raise SystemExit("Feuille vide.")
+    head = [h.strip() for h in rows[0]]
+    if head[:16] != HEADERS:
+        raise SystemExit("En-têtes inattendus.\n  attendu : %s\n  reçu    : %s" % (HEADERS, head[:16]))
+    # Colonne Q facultative, repérée par son en-tête (17e colonne) ; sinon ignorée comme avant
+    qi = 16 if len(head) > 16 and head[16] == MAJ_HEADER else None
+    out = []
+    for n, r in enumerate(rows[1:], start=2):
+        r = [c.strip() for c in r] + [""] * (17 - len(r))
+        if not any(r[:16]):
+            continue
+        out.append((n, r[:16] + ([r[qi]] if qi is not None else [])))
+    return out
+
+
+def build_events(rows, errors):
+    events, seen = [], set()
+    for n, r in rows:
+        (id_, typ, annee, d_ev, d_en, nom, seuil, cat, pays, lieu, desc, lat, lon, s1, s2, s3) = r[:16]
+        d_maj = r[16] if len(r) > 16 else None  # None : colonne Q absente de la feuille
+        loc = f"ligne {n} ({id_ or 'sans ID'})"
+        if not id_:
+            errors.append(f"{loc} : ID manquant"); continue
+        if id_ in seen:
+            errors.append(f"{loc} : ID en double")
+        seen.add(id_)
+        if typ not in TYPES: errors.append(f"{loc} : Type « {typ} » (attendu Nouveau ou Passé)")
+        if seuil not in SEUILS: errors.append(f"{loc} : Seuil « {seuil} » inconnu")
+        if cat not in CATS: errors.append(f"{loc} : Catégorie « {cat} » inconnue")
+        for label, val in (("Nom", nom), ("Pays", pays), ("Descriptif", desc)):
+            if not val: errors.append(f"{loc} : {label} vide")
+        date = parse_date(d_ev); entree = parse_date(d_en)
+        if not date: errors.append(f"{loc} : Date événement illisible « {d_ev} »")
+        if not entree: errors.append(f"{loc} : Date entrée illisible « {d_en} »")
+        maj = None
+        if d_maj is not None:
+            maj = parse_date(d_maj) if d_maj else ""
+            if maj is None:
+                errors.append(f"{loc} : Date mise à jour illisible « {d_maj} »")
+            elif maj and entree and maj < entree:
+                errors.append(f"{loc} : Date mise à jour {d_maj} antérieure à la Date entrée {d_en}")
+        # Plusieurs points pour un même événement : valeurs séparées par « ; » (le premier est le point principal)
+        las, los = [parse_num(x) for x in lat.split(";")], [parse_num(x) for x in lon.split(";")]
+        la, lo = las[0], los[0]
+        if len(las) != len(los):
+            errors.append(f"{loc} : {len(las)} latitudes pour {len(los)} longitudes (Lat « {lat} », Lon « {lon} »)")
+        for a_, b_ in zip(las, los):
+            if a_ is None or b_ is None or not (30 <= a_ <= 75 and -25 <= b_ <= 50):
+                errors.append(f"{loc} : coordonnées invalides (Lat « {lat} », Lon « {lon} »)"); break
+        more = [{"lat": a_, "lon": b_} for a_, b_ in zip(las[1:], los[1:]) if a_ is not None and b_ is not None]
+        srcs = [s for s in (s1, s2, s3) if s]
+        if not srcs: errors.append(f"{loc} : aucune source")
+        for s in srcs:
+            if not s.startswith(("http://", "https://")):
+                errors.append(f"{loc} : source qui n'est pas un lien « {s[:50]} »")
+        if date and annee and annee.isdigit() and int(annee) != int(date[:4]):
+            errors.append(f"{loc} : Année {annee} ≠ année de la date {date}")
+        events.append({"id": id_, "passe": TYPES.get(typ, False), "date": date, "entree": entree, "nom": nom,
+                       "seuil": seuil, "cat": cat, "pays": pays, "lieu": lieu, "desc": desc,
+                       "lat": la, "lon": lo, "sources": srcs, **({"more": more} if more else {}),
+                       **({"maj": maj} if maj is not None else {})})
+    return events
+
+
+def place(events, old):
+    """Ajoute 'pos' à chaque événement (raw = projection exacte ; eu = raw écarté des voisins)."""
+    old_by_id = {e["id"]: e for e in old}
+    fixed, todo = [], []
+    for e in events:
+        o = old_by_id.get(e["id"])
+        if o and o.get("pos") and abs(o["lat"] - e["lat"]) < 1e-9 and abs(o["lon"] - e["lon"]) < 1e-9:
+            e["pos"] = o["pos"]; fixed.append(e)
+        else:
+            todo.append(e)
+    taken = [(e["pos"]["eu"][0] * W / 100, e["pos"]["eu"][1] * H / 100) for e in fixed]
+    for e in todo:
+        x, y = project(e["lat"], e["lon"])
+        raw = [round(x / W * 100, 3), round(y / H * 100, 3)]
+        px, py = x, y
+        if any(math.hypot(px - tx, py - ty) < MIN_DIST for tx, ty in taken):
+            done = False
+            for ring in range(1, 400):
+                r = ring * 0.5
+                steps = max(12, int(2 * math.pi * r / 1.5))
+                for s in range(steps):
+                    a = 2 * math.pi * s / steps
+                    cx, cy = x + r * math.cos(a), y + r * math.sin(a)
+                    if all(math.hypot(cx - tx, cy - ty) >= MIN_DIST for tx, ty in taken):
+                        px, py, done = cx, cy, True; break
+                if done: break
+        taken.append((px, py))
+        e["pos"] = {"eu": [round(px / W * 100, 2), round(py / H * 100, 2)], "raw": raw}
+    # points supplémentaires (même événement, plusieurs lieux)
+    for e in events:
+        if not e.get("more"):
+            continue
+        o = old_by_id.get(e["id"])
+        same = o and [(m["lat"], m["lon"]) for m in o.get("more", [])] == [(m["lat"], m["lon"]) for m in e["more"]] and all(m.get("pos") for m in o["more"])
+        if same:
+            for m, om in zip(e["more"], o["more"]): m["pos"] = om["pos"]
+            for m in e["more"]: taken.append((m["pos"]["eu"][0] * W / 100, m["pos"]["eu"][1] * H / 100))
+            continue
+        for m in e["more"]:
+            x, y = project(m["lat"], m["lon"])
+            raw = [round(x / W * 100, 3), round(y / H * 100, 3)]
+            px, py = x, y
+            if any(math.hypot(px - tx, py - ty) < MIN_DIST for tx, ty in taken):
+                done = False
+                for ring in range(1, 400):
+                    r = ring * 0.5
+                    steps = max(12, int(2 * math.pi * r / 1.5))
+                    for s in range(steps):
+                        a = 2 * math.pi * s / steps
+                        cx, cy = x + r * math.cos(a), y + r * math.sin(a)
+                        if all(math.hypot(cx - tx, cy - ty) >= MIN_DIST for tx, ty in taken):
+                            px, py, done = cx, cy, True; break
+                    if done: break
+            taken.append((px, py))
+            m["pos"] = {"eu": [round(px / W * 100, 2), round(py / H * 100, 2)], "raw": raw}
+    return events
+
+
+def ordered(e):
+    return {k: e[k] for k in ("id", "passe", "date", "entree", "maj", "nom", "seuil", "cat", "pays", "lieu", "desc",
+                              "lat", "lon", "sources", "pos", "more") if k in e}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", help="fichier CSV local (sinon : SHEET_CSV_URL)")
+    ap.add_argument("--out", default="observatoire-data.json")
+    ap.add_argument("--summary", help="écrit un résumé des changements (message de commit)")
+    ap.add_argument("--allow-shrink", action="store_true", help="accepter une forte baisse du nombre de lignes")
+    a = ap.parse_args()
+
+    src = a.csv or os.environ.get("SHEET_CSV_URL", "")
+    if not src: raise SystemExit("SHEET_CSV_URL non défini.")
+    old_json = json.load(open(a.out, encoding="utf-8")) if os.path.exists(a.out) else {}
+    old = old_json.get("events", [])
+
+    errors = []
+    events = build_events(read_rows(fetch(src), errors), errors)
+    media = None
+    murl = os.environ.get("MEDIA_CSV", "") or media_url()
+    if murl:
+        try:
+            mtext = fetch(murl)
+        except SystemExit as ex:
+            print(f"Onglet Médias illisible ({ex}) ; images inchangées.", file=sys.stderr); mtext = ""
+        media = build_media(mtext, {e["id"] for e in events}, errors)
+    if errors:
+        print("La feuille contient %d problème(s) ; rien n'a été écrit :" % len(errors), file=sys.stderr)
+        for m in errors[:60]: print(" -", m, file=sys.stderr)
+        sys.exit(1)
+    # Garde-fou : un retrait isolé passe, une baisse de plus de MAX_DROP lignes d'un coup bloque la publication
+    # (le site garde l'ancienne version). Pour un retrait volontaire plus large : lancer avec --allow-shrink.
+    if old and len(old) - len(events) > MAX_DROP and not a.allow_shrink:
+        raise SystemExit(f"{len(events)} lignes contre {len(old)} avant (baisse de {len(old) - len(events)}, "
+                         f"maximum {MAX_DROP}) : baisse suspecte, rien n'est écrit.")
+    for k in ("land", "east", "grat", "vb"):
+        if old and k not in old_json: raise SystemExit(f"Le fichier existant n'a pas la clé « {k} ».")
+
+    events = [ordered(e) for e in place(events, old)]
+    new_json = dict(old_json) if old_json else {}
+    new_json["events"] = events
+    if media is not None:
+        new_json["media"] = media
+    with open(a.out, "w", encoding="utf-8") as f:
+        json.dump(new_json, f, ensure_ascii=False, separators=(",", ":"))
+
+    oldm = {e["id"]: e for e in old}; newm = {e["id"]: e for e in events}
+    added = [i for i in newm if i not in oldm]; removed = [i for i in oldm if i not in newm]
+    # « maj » vide et « maj » absent valent la même chose : l'arrivée de la colonne Q ne marque pas tout comme modifié
+    cmp_ = lambda e: {k: v for k, v in e.items() if k != "pos" and not (k == "maj" and not v)}
+    changed = [i for i in newm if i in oldm and cmp_(newm[i]) != cmp_(oldm[i])]
+    lines = [f"Données de l'Observatoire : {len(events)} événements"]
+    if added: lines.append("Ajoutés : " + ", ".join(added))
+    if removed: lines.append("Supprimés : " + ", ".join(removed))
+    if changed: lines.append("Modifiés : " + ", ".join(changed))
+    om, nm = old_json.get("media", {}), new_json.get("media", {})
+    madd = [i for i in nm if i not in om]; mrem = [i for i in om if i not in nm]
+    mchg = [i for i in nm if i in om and nm[i] != om[i]]
+    if madd: lines.append("Images ajoutées : " + ", ".join(madd))
+    if mrem: lines.append("Images retirées : " + ", ".join(mrem))
+    if mchg: lines.append("Images modifiées : " + ", ".join(mchg))
+    msg = "\n".join(lines)
+    print(msg)
+    if a.summary: open(a.summary, "w", encoding="utf-8").write(msg + "\n")
+
+
+if __name__ == "__main__":
+    main()
