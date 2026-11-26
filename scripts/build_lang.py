@@ -12,7 +12,7 @@ import i18n
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "observatoire.html")
-DATA_FR = "https://marinsai.github.io/obs_russie/observatoire-data.json"
+DATA_FR = "https://gc-geg.github.io/obs_russie/observatoire-data.json"
 
 
 def esc_js(s):
