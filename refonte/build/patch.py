@@ -524,5 +524,6 @@ exec(compile(open(os.path.join(ROOT, 'build/patch_v28.py'), encoding='utf-8').re
 exec(compile(open(os.path.join(ROOT, 'build/patch_v29.py'), encoding='utf-8').read(), 'patch_v29.py', 'exec'))
 exec(compile(open(os.path.join(ROOT, 'build/patch_v30.py'), encoding='utf-8').read(), 'patch_v30.py', 'exec'))
 exec(compile(open(os.path.join(ROOT, 'build/patch_v31.py'), encoding='utf-8').read(), 'patch_v31.py', 'exec'))
+exec(compile(open(os.path.join(ROOT, 'build/patch_v32.py'), encoding='utf-8').read(), 'patch_v32.py', 'exec'))
 open(os.path.join(ROOT, 'build/template.html'), 'w', encoding='utf-8').write(t)
 print('gabarit écrit :', len(t), 'caractères')
