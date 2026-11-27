@@ -9,6 +9,9 @@ La page test (`observatoire_test.html`) est produite à partir de `observatoire.
 - `build/extra.css`, `build/assets.css` : styles ajoutés (hexagones, grain, mouvement réduit).
 - `build/motion.js` : animations, étiquettes de pays, pictogrammes.
 - `tools/pw.py` : serveur local + navigateur avec les données servies en local.
+- `tools/parent.html` : page parente de test qui reproduit l'article du site, avec l'iframe pleine largeur entre deux blocs de texte.
+  `tools/iframe_test.py` la copie dans `site/` et y charge `site/observatoire.html` (copier d'abord la page à tester sous ce nom).
+  Il vérifie à 1440 et 390 px que la hauteur du cadre suit le contenu, volets du journal et méthodologie ouverts puis fermés.
 - `tools/perf.py`, `tools/iframe_test.py`, `tests/*.py` : vérifications (fluidité, hauteur d'iframe,
   mouvement réduit, clavier, clics, étiquettes FR/IT, activité au repos, captures, maquettes).
 

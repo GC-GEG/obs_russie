@@ -33,5 +33,8 @@ async def main(w, mob):
         print('  journal ouvert/changé/fermé, méthodo ouverte/fermée :', h0[:2], h1[:2], h2[:2], h3[:2], h4[:2], h5[:2])
         print('  volets restants :', await fr.evaluate('document.querySelectorAll("#journal .acc").length'), 'erreurs', errs)
         await b.close()
+# page parente qui reproduit l'article du site (iframe pleine largeur, texte avant et après)
+import shutil
+shutil.copy(os.path.join(ROOT, 'tools/parent.html'), os.path.join(ROOT, 'site/parent.html'))
 serve()
 asyncio.run(main(1440, False)); asyncio.run(main(390, True))
